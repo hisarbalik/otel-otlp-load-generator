@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -67,22 +68,32 @@ func initProvider() (func(context.Context) error, error) {
 	return tracerProvider.Shutdown, nil
 }
 
-func main() {
-	log.Printf("Waiting for connection...")
+type Task struct {
+	closed chan struct{}
+	wg     sync.WaitGroup
+	ticker *time.Ticker
+}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
-	shutdown, err := initProvider()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() {
-		if err := shutdown(ctx); err != nil {
-			log.Fatal("failed to shutdown TracerProvider: %w", err)
+func (t *Task) Run(ctx context.Context) {
+	for {
+		select {
+		case <-t.closed: {
+			ctx.Done()
+			return
 		}
-	}()
 
+		case <-t.ticker.C:
+			handle(ctx)
+		}
+	}
+}
+
+func (t *Task) Stop() {
+	close(t.closed)
+	t.wg.Wait()
+}
+
+func handle(ctx context.Context) {
 	tracer := otel.Tracer("OTLP-Load-Tester")
 
 	// Attributes represent additional key-value descriptors that can be bound
@@ -105,6 +116,40 @@ func main() {
 		//wait 5 millisecond for next span
 		<-time.After(time.Millisecond * 5)
 		iSpan.End()
+	}
+}
+
+func main() {
+	log.Printf("Waiting for connection...")
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	shutdown, err := initProvider()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := shutdown(ctx); err != nil {
+			log.Fatal("failed to shutdown TracerProvider: %w", err)
+		}
+	}()
+
+	task := &Task{
+		closed: make(chan struct{}),
+		ticker: time.NewTicker(time.Millisecond),
+	}
+
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt)
+
+	task.wg.Add(1)
+	go func() { defer task.wg.Done(); task.Run(ctx) }()
+
+	select {
+	case sig := <-c:
+		fmt.Printf("Got %s signal. Aborting...\n", sig)
+		task.Stop()
 	}
 
 	log.Printf("Done!")
