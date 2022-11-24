@@ -27,7 +27,7 @@ import (
 const (
 	exitCodeInterrupt = 2
 
-	traceCount     = 10
+	childSpanTotal = 10
 )
 
 var targetURl = "localhost:4317"
@@ -43,9 +43,10 @@ func main() {
 		fmt.Printf("./loadgenerator -t telemerty-collector:4317 -c 5\n")
 	}
 
-	flag.Parse()  // after
+	flag.Parse() // after
 
-	log.Printf("Waiting for connection...")
+	log.Print("Load Generator")
+	log.Print("Waiting for connection...")
 
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
@@ -76,8 +77,10 @@ func main() {
 		os.Exit(exitCodeInterrupt)
 	}()
 
+	start := time.Now()
 	run(ctx)
-	log.Printf("Done!")
+	elapsed := time.Since(start)
+	log.Printf("Took %s", elapsed)
 }
 
 func initProvider() (func(context.Context) error, error) {
@@ -134,25 +137,28 @@ func run(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			for range jobsCh {
-				produceSpan(ctx)
+				produceTrace(ctx)
 			}
 		}()
 	}
 
+	jobsTotal := 0
 	for {
 		select {
 		case jobsCh <- struct{}{}:
+			jobsTotal++
 		case <-ctx.Done():
 			log.Print("Context cancelled, closing the jobs channel...")
 			close(jobsCh)
 			log.Print("Closed the jobs channel")
 			wg.Wait()
+			log.Printf("Total traces: %d, spans: %d produced", jobsTotal, jobsTotal*(childSpanTotal+1))
 			return
 		}
 	}
 }
 
-func produceSpan(ctx context.Context) {
+func produceTrace(ctx context.Context) {
 	tracer := otel.Tracer("otlp-load-tester")
 
 	commonAttrs := []attribute.KeyValue{
@@ -163,7 +169,7 @@ func produceSpan(ctx context.Context) {
 
 	ctx, span := tracer.Start(ctx, "root", trace.WithAttributes(commonAttrs...))
 	defer span.End()
-	for i := 0; i < traceCount; i++ {
+	for i := 0; i < childSpanTotal; i++ {
 		_, iSpan := tracer.Start(ctx, fmt.Sprintf("child-%d", i))
 		iSpan.SetAttributes(generateRandomAttributes()...)
 		time.Sleep(time.Millisecond * 5)
