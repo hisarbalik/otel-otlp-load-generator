@@ -23,13 +23,56 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+const (
+	exitCodeInterrupt = 2
+
+	traceCount     = 10
+	maxParallelism = 2
+)
+
+func main() {
+	log.Printf("Waiting for connection...")
+
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt)
+	defer func() {
+		signal.Stop(signalChan)
+		cancel()
+	}()
+
+	shutdown, err := initProvider()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := shutdown(ctx); err != nil {
+			log.Fatal("Failed to shutdown TracerProvider: %w", err)
+		}
+	}()
+
+	go func() {
+		select {
+		case <-signalChan: // first signal, cancel context
+			cancel()
+		case <-ctx.Done():
+		}
+		<-signalChan // second signal, hard exit
+		os.Exit(exitCodeInterrupt)
+	}()
+
+	run(ctx)
+	log.Printf("Done!")
+}
+
 func initProvider() (func(context.Context) error, error) {
 	ctx := context.Background()
 
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
 			// the service name used to display traces in backends
-			semconv.ServiceNameKey.String("OTEL-Load-Generator"),
+			semconv.ServiceNameKey.String("otel-load-generator"),
 		),
 	)
 	if err != nil {
@@ -61,98 +104,57 @@ func initProvider() (func(context.Context) error, error) {
 	)
 	otel.SetTracerProvider(tracerProvider)
 
-	// set global propagator to tracecontext (the default is no-op).
+	// set global propagator to trace context (the default is no-op).
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	// Shutdown will flush any remaining spans and shut down the exporter.
 	return tracerProvider.Shutdown, nil
 }
 
-type Task struct {
-	closed chan struct{}
-	wg     sync.WaitGroup
-	ticker *time.Ticker
-}
+func run(ctx context.Context) {
+	jobsCh := make(chan struct{}, maxParallelism)
+	var wg sync.WaitGroup
+	wg.Add(maxParallelism)
 
-func (t *Task) Run(ctx context.Context) {
+	for i := 0; i < maxParallelism; i++ {
+		go func() {
+			defer wg.Done()
+			for range jobsCh {
+				produceSpan(ctx)
+			}
+		}()
+	}
+
 	for {
 		select {
-		case <-t.closed: {
-			ctx.Done()
+		case jobsCh <- struct{}{}:
+		case <-ctx.Done():
+			log.Print("Context cancelled, closing the jobs channel...")
+			close(jobsCh)
+			log.Print("Closed the jobs channel")
+			wg.Wait()
 			return
-		}
-
-		case <-t.ticker.C:
-			handle(ctx)
 		}
 	}
 }
 
-func (t *Task) Stop() {
-	close(t.closed)
-	t.wg.Wait()
-}
+func produceSpan(ctx context.Context) {
+	tracer := otel.Tracer("otlp-load-tester")
 
-func handle(ctx context.Context) {
-	tracer := otel.Tracer("OTLP-Load-Tester")
-
-	// Attributes represent additional key-value descriptors that can be bound
-	// to a metric observer or recorder.
 	commonAttrs := []attribute.KeyValue{
 		attribute.String("attrA", "chocolate"),
 		attribute.String("attrB", "raspberry"),
 		attribute.String("attrC", "vanilla"),
 	}
 
-	// work begins
-	ctx, span := tracer.Start(
-		ctx,
-		"Root Span",
-		trace.WithAttributes(commonAttrs...))
+	ctx, span := tracer.Start(ctx, "root", trace.WithAttributes(commonAttrs...))
 	defer span.End()
-	for i := 0; i < 10; i++ {
-		_, iSpan := tracer.Start(ctx, fmt.Sprintf("Child-Span-%d", i))
+	for i := 0; i < traceCount; i++ {
+		_, iSpan := tracer.Start(ctx, fmt.Sprintf("child-%d", i))
 		iSpan.SetAttributes(generateRandomAttributes()...)
-		//wait 5 millisecond for next span
-		<-time.After(time.Millisecond * 5)
+		time.Sleep(time.Millisecond * 5)
 		iSpan.End()
 	}
-}
-
-func main() {
-	log.Printf("Waiting for connection...")
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
-	shutdown, err := initProvider()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() {
-		if err := shutdown(ctx); err != nil {
-			log.Fatal("failed to shutdown TracerProvider: %w", err)
-		}
-	}()
-
-	task := &Task{
-		closed: make(chan struct{}),
-		ticker: time.NewTicker(time.Millisecond),
-	}
-
-	c := make(chan os.Signal)
-	signal.Notify(c, os.Interrupt)
-
-	task.wg.Add(1)
-	go func() { defer task.wg.Done(); task.Run(ctx) }()
-
-	select {
-	case sig := <-c:
-		fmt.Printf("Got %s signal. Aborting...\n", sig)
-		task.Stop()
-	}
-
-	log.Printf("Done!")
 }
 
 func generateRandomAttributes() []attribute.KeyValue {
