@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"math/rand"
@@ -27,10 +28,23 @@ const (
 	exitCodeInterrupt = 2
 
 	traceCount     = 10
-	maxParallelism = 2
 )
 
+var targetURl = "localhost:4317"
+var maxParallelism = 2
+
 func main() {
+
+	flag.StringVar(&targetURl, "t", "localhost:4317", "Specify otel collector url")
+	flag.IntVar(&maxParallelism, "c", 2, "Specify max concurrent span generator")
+
+	flag.Usage = func() {
+		fmt.Printf("Usage of loadgenerator: \n")
+		fmt.Printf("./loadgenerator -t telemerty-collector:4317 -c 5\n")
+	}
+
+	flag.Parse()  // after
+
 	log.Printf("Waiting for connection...")
 
 	ctx := context.Background()
