@@ -45,7 +45,7 @@ func main() {
 
 	flag.Parse() // after
 
-	log.Print("Load Generator")
+	log.Printf("Load Generator started for %s with %d concurent producers", targetURl, maxParallelism)
 	log.Print("Waiting for connection...")
 
 	ctx := context.Background()
